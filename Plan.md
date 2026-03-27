@@ -790,15 +790,3 @@ Certbot will handle the HTTPS certificate automatically.
 A server running at `https://yourdomain.com` that accepts POST requests to `/run` with an API key. It can run Python or Node code in isolation, handle any of the named commands, convert docx to PDF, and return output files. Anything — your AI agent, a web app, a curl command from your laptop — can use it.
 
 To add a new command you add one entry to the `COMMANDS` object in `commands.js` and one handler function. To add a new custom utility you add one endpoint. Nothing else changes.
-
----
-
-## What to write on your resume
-
-**Execify — Sandboxed Code Execution Engine**
-
-Built a language-agnostic code execution service that runs untrusted Python and Node.js code in isolated Docker containers with no network access, memory limits, and automatic workspace cleanup. Designed a command registry pattern allowing named operations (file I/O, URL fetching, archiving) to be added without modifying the execution core. Used container pooling to serve concurrent users without per-request container startup overhead. Deployed on a Linux VPS behind nginx with HTTPS and API key authentication.
-
-**Technologies:** Node.js, Express, Docker, Linux namespaces, nginx, PM2
-
-**Impact framing for interviews:** "This is the execution layer that makes an AI agent able to produce real files — not just text. The agent sends code, the sandbox runs it safely, and a real .docx or .pdf comes back."
