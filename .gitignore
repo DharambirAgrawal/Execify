@@ -1,0 +1,7 @@
+node_modules
+workspace
+package-lock.json
+.env
+dist
+coverage
+logs
