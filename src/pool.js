@@ -1,8 +1,9 @@
 const { execSync, exec } = require('child_process')
 const { promisify } = require('util')
+const config = require('./config')
 const execAsync = promisify(exec)
 
-const POOL_SIZE = 3
+const POOL_SIZE = config.workerPool.size
 const pool = []
 
 async function startContainer(id) {
@@ -15,13 +16,13 @@ async function startContainer(id) {
   await execAsync(`
     docker run -d \
       --name ${name} \
-      --network none \
-      --memory 256m \
-      --cpus 0.5 \
+      --network ${config.workerPool.networkMode} \
+      --memory ${config.workerPool.memoryMb}m \
+      --cpus ${config.workerPool.cpus} \
       --read-only \
-      --tmpfs /workspace:size=100m,uid=1001 \
-      --user 1001 \
-      execify-sandbox
+      --tmpfs /workspace:size=${config.workerPool.tmpfsSizeMb}m,uid=${config.workerPool.workspaceUid} \
+      --user ${config.workerPool.workspaceUid} \
+      ${config.workerPool.image}
   `)
 
   return {

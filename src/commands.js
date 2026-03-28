@@ -7,12 +7,13 @@ const path = require('path')
 const https = require('https')
 const http = require('http')
 const { getWorker, markBusy, markFree } = require('./pool')
+const config = require('./config')
 
 const execFileAsync = promisify(execFile)
 
-const SAFE_FILENAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
-const FETCH_TIMEOUT_MS = 10000
-const ALLOWED_HTTP_METHODS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'])
+const SAFE_FILENAME_RE = config.SAFE_FILENAME_RE
+const FETCH_TIMEOUT_MS = config.commands.fetchTimeoutMs
+const ALLOWED_HTTP_METHODS = new Set(config.commands.allowedHttpMethods)
 
 function sanitizeFilename(rawName) {
   if (typeof rawName !== 'string') {
@@ -32,15 +33,13 @@ function getTempPath(prefix) {
 }
 
 async function dockerExec(args) {
-  return execFileAsync('docker', args, { maxBuffer: 10 * 1024 * 1024 })
+  return execFileAsync('docker', args, { maxBuffer: config.execution.maxDockerBufferBytes })
 }
 
 // Only these URLs can be fetched via fetch_url
 // Add to this list as needed
 const URL_WHITELIST = new Set([
-  'https://api.github.com',
-  'https://jsonplaceholder.typicode.com',
-  // add your trusted domains here
+  ...config.commands.urlWhitelist
 ])
 
 function isWhitelisted(url) {

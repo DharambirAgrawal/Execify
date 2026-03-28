@@ -74,9 +74,24 @@ Create `.env` in project root:
 ```env
 API_KEYS=key-abc123,key-def456
 PORT=3000
+ALLOWED_INPUT_EXTENSIONS=.txt,.json,.csv,.md,.pdf,.docx,.xlsx,.png,.jpg,.jpeg
+ALLOWED_OUTPUT_EXTENSIONS=.txt,.json,.csv,.md,.pdf,.docx,.xlsx,.png,.jpg,.jpeg,.zip
+PERSIST_OUTPUTS=false
+PERSIST_OUTPUT_DIR=workspace/jobs
+MODULE_PROBE_TIMEOUT_MS=15000
+MODULE_LIST_MAX_ITEMS=2000
 ```
 
 `API_KEYS` is a comma-separated list of allowed request keys.
+
+### Execution Policy Controls
+
+- `ALLOWED_INPUT_EXTENSIONS`: input files accepted in `files[]` for execute requests
+- `ALLOWED_OUTPUT_EXTENSIONS`: only these generated files are returned in `outputFiles`
+- `PERSIST_OUTPUTS=true`: also save generated output files on host disk
+- `PERSIST_OUTPUT_DIR`: host directory used when persistence is enabled
+
+If an extension is not allowed, execution is rejected before run.
 
 ## Run Locally
 
@@ -126,6 +141,30 @@ Request body depends on `type`:
 
 - `type: "execute"` for code execution
 - `type: "command"` for named command execution
+
+For execute requests, responses include deterministic error metadata:
+
+- `errorType: syntax_error` -> do not retry (code must be fixed)
+- `errorType: missing_dependency` -> do not retry (library unavailable)
+- `errorType: input_validation` -> do not retry (invalid file/request shape)
+- `errorType: runtime_error` -> retry optional
+- `errorType: timeout` -> retry allowed
+
+`retryable` is returned as a boolean for agent logic.
+
+### 4) Installed Modules Endpoint (Auth Required)
+
+```http
+GET /installed-modules
+X-API-Key: <your-key>
+```
+
+Returns module inventory from a live worker:
+
+- Python: available top-level modules from the worker runtime
+- Node: builtin modules + global npm packages
+
+Use this endpoint before code generation so your AI agent can avoid unsupported libraries.
 
 ## Usage Examples
 
@@ -182,6 +221,8 @@ curl -X POST http://localhost:3000/run \
 		"code": "with open(\"hello.txt\", \"w\") as f:\n    f.write(\"created inside sandbox\")"
 	}'
 ```
+
+By default output files are not persisted on host disk; they are copied from container to response and temporary files are deleted. If `PERSIST_OUTPUTS=true`, files are also saved under `PERSIST_OUTPUT_DIR/<jobId>`.
 
 ## Supported Commands
 

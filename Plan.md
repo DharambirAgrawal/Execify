@@ -1,792 +1,261 @@
-# Execify — Build Guide
-### Sandboxed code and command execution engine
+# Execify — Build and Operating Plan
+### Sandboxed code + command execution engine with centralized config
 
 ---
 
-## What you are building
+## 1. Objective
 
-A Node.js HTTP server that accepts two kinds of requests — run code (Python or JS) and run a named command (fetch a URL, create a file, zip files, etc.) — executes them safely inside Docker containers, and returns the output. It is completely self-contained. Anything can call it: your AI agent, a web app, a curl command.
+Build a Node.js HTTP service that can:
 
-By the end you will have this running on a server, accessible over HTTPS, with API key auth.
+- run user-generated code (`python` or `node`) in isolated Docker workers
+- run named commands (`fetch_url`, `write_file`, `zip_files`, etc.)
+- return logs and generated files
+- classify failures so an AI agent knows whether to retry
 
----
-
-## Before you start — what you need to know
-
-You do not need to know Docker deeply. You need to understand one idea: a Docker container is a process that thinks it is its own computer. It has its own filesystem, its own network (or none), and when it stops, everything inside it disappears. That is the entire security model here.
-
-You need basic Node.js comfort — writing an Express server, async/await, reading and writing files.
-
-That is it.
+The service is API-key protected and designed for agent usage.
 
 ---
 
-## Tools to install on your machine
+## 2. Current Architecture
 
-- **Node.js** v18 or higher — your API server runs on this
-- **Docker Desktop** — the isolation layer, install from docker.com
-- **Git** — for version control
+Project structure now:
 
-Verify everything works before continuing:
-
-```
-node --version
-docker --version
-git --version
-```
-
----
-
-## Project structure
-
-Create this folder structure. You will fill each file in as you go through this guide.
-
-```
-execify/
+```text
+Execify/
 ├── src/
-│   ├── server.js          — Express app, routes
-│   ├── queue.js           — Job queue (in-memory to start)
-│   ├── pool.js            — Container pool manager
-│   ├── executor.js        — Runs code inside a container
-│   ├── commands.js        — Command registry and handlers
-│   ├── auth.js            — API key middleware
-│   └── output.js          — Collect and encode output files
+│   ├── config.js          # central constants and env-based policy
+│   ├── server.js          # API routes and orchestration
+│   ├── pool.js            # docker worker pool manager
+│   ├── executor.js        # code execution + preflight + output handling
+│   ├── commands.js        # named command handlers
+│   ├── auth.js            # API key middleware
+│   ├── queue.js           # in-memory queue utility
+│   └── output.js          # output helper utilities
 ├── docker/
-│   └── Dockerfile         — The sandbox container image
-├── workspace/             — Temp job directories go here (auto-created)
-├── .env                   — API keys and config
-├── package.json
-└── README.md
-```
-
-Run this to create it all at once:
-
-```bash
-mkdir execify && cd execify
-mkdir -p src docker workspace
-touch src/server.js src/queue.js src/pool.js src/executor.js
-touch src/commands.js src/auth.js src/output.js
-touch docker/Dockerfile .env
-npm init -y
-npm install express dotenv uuid
+│   └── Dockerfile         # sandbox image
+├── workspace/
+├── .env
+├── README.md
+└── Plan.md
 ```
 
 ---
 
-## Phase 1 — Build the Docker image
+## 3. Single Source of Configuration
 
-This is the container your code will actually run inside. You build it once and reuse it.
+All important constants and tunables are centralized in `src/config.js`.
 
-Open `docker/Dockerfile` and write this:
+### Config sections
 
-```dockerfile
-FROM node:18-slim
+- `app`: port, request body size
+- `execution`: language allowlist, code size limit, timeout, extension policy, output persistence
+- `workerPool`: pool size and container runtime limits
+- `commands`: URL whitelist, fetch timeout, allowed HTTP methods
+- `retryRules`: retry behavior per error type
+- `limits`: values shown in capabilities endpoint
+- `SAFE_FILENAME_RE`: shared filename policy
 
-RUN apt-get update && apt-get install -y \
-    python3 \
-    python3-pip \
-    python3-venv \
-    curl \
-    zip \
-    unzip \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN pip3 install --break-system-packages \
-    python-docx \
-    pandas \
-    openpyxl \
-    requests \
-    pillow
-
-RUN useradd -m -u 1001 sandboxuser
-
-RUN mkdir -p /workspace && chown sandboxuser:sandboxuser /workspace
-
-USER sandboxuser
-
-WORKDIR /workspace
-
-CMD ["tail", "-f", "/dev/null"]
-```
-
-The last line keeps the container alive and doing nothing. Your server will reach into it to run jobs.
-
-Build the image:
-
-```bash
-docker build -t execify-sandbox ./docker
-```
-
-This will take 2-3 minutes the first time. When it finishes, verify it exists:
-
-```bash
-docker images | grep execify-sandbox
-```
+This means you can adjust behavior from one file instead of hunting across modules.
 
 ---
 
-## Phase 2 — The container pool
+## 4. Security and Isolation Model
 
-Instead of starting a new container for every job (slow, resource heavy), you start a fixed number upfront and reuse them.
+### Worker container controls
 
-Open `src/pool.js`:
+Workers are launched with:
 
-```javascript
-const { execSync, exec } = require('child_process')
-const { promisify } = require('util')
-const execAsync = promisify(exec)
+- no network (`--network none`)
+- memory and CPU caps
+- read-only root filesystem
+- writable tmpfs only at `/workspace`
+- non-root user
 
-const POOL_SIZE = 3
-const pool = []
+### Shell safety
 
-async function startContainer(id) {
-  const name = `execify-worker-${id}`
-
-  try {
-    execSync(`docker rm -f ${name}`, { stdio: 'ignore' })
-  } catch {}
-
-  await execAsync(`
-    docker run -d \
-      --name ${name} \
-      --network none \
-      --memory 256m \
-      --cpus 0.5 \
-      --read-only \
-      --tmpfs /workspace:size=100m,uid=1001 \
-      --user 1001 \
-      execify-sandbox
-  `)
-
-  return {
-    id,
-    name,
-    busy: false
-  }
-}
-
-async function initPool() {
-  console.log(`Starting ${POOL_SIZE} sandbox containers...`)
-  for (let i = 0; i < POOL_SIZE; i++) {
-    const worker = await startContainer(i)
-    pool.push(worker)
-    console.log(`Worker ${i} ready`)
-  }
-  console.log('Pool ready')
-}
-
-function getWorker() {
-  return pool.find(w => !w.busy) || null
-}
-
-function markBusy(worker) {
-  worker.busy = true
-}
-
-function markFree(worker) {
-  worker.busy = false
-}
-
-async function cleanWorkerWorkspace(worker) {
-  try {
-    await execAsync(`docker exec ${worker.name} sh -c "rm -rf /workspace/*"`)
-  } catch {}
-}
-
-module.exports = { initPool, getWorker, markBusy, markFree, cleanWorkerWorkspace }
-```
-
-Key decisions here: `--network none` means zero internet access inside the container. `--read-only` means the filesystem cannot be written except the `/workspace` tmpfs we explicitly allow. `--memory 256m` means a runaway script cannot eat your server's RAM.
+- Docker calls use argument-safe process execution (`execFile`) for user-influenced values.
+- Filenames are sanitized and restricted via `SAFE_FILENAME_RE`.
+- Path traversal is blocked by `path.basename` normalization.
 
 ---
 
-## Phase 3 — The executor
+## 5. Execution Flow (run code)
 
-This is the core function and It takes code and a language, copies the code into the container, runs it, and returns what came out.
+When `POST /run` with `type: execute` arrives:
 
-Open `src/executor.js`:
-
-```javascript
-const { exec } = require('child_process')
-const { promisify } = require('util')
-const fs = require('fs').promises
-const path = require('path')
-const { v4: uuidv4 } = require('uuid')
-const { getWorker, markBusy, markFree, cleanWorkerWorkspace } = require('./pool')
-
-const execAsync = promisify(exec)
-
-const TIMEOUT_MS = 30000
-
-async function runCode(language, code, inputFiles = []) {
-  const worker = getWorker()
-
-  if (!worker) {
-    return { error: 'All workers busy, try again shortly', status: 503 }
-  }
-
-  markBusy(worker)
-  const jobId = uuidv4()
-
-  try {
-    await cleanWorkerWorkspace(worker)
-
-    // Write input files into the container
-    for (const file of inputFiles) {
-      const content = Buffer.from(file.content, 'base64')
-      const tmpPath = `/tmp/execify-upload-${jobId}-${file.name}`
-      await fs.writeFile(tmpPath, content)
-      await execAsync(`docker cp ${tmpPath} ${worker.name}:/workspace/${file.name}`)
-      await fs.unlink(tmpPath)
-    }
-
-    // Write the code file
-    const filename = language === 'python' ? 'main.py' : 'main.js'
-    const tmpCodePath = `/tmp/execify-code-${jobId}`
-    await fs.writeFile(tmpCodePath, code)
-    await execAsync(`docker cp ${tmpCodePath} ${worker.name}:/workspace/${filename}`)
-    await fs.unlink(tmpCodePath)
-
-    // Run it
-    const runner = language === 'python' ? 'python3' : 'node'
-    const cmd = `docker exec ${worker.name} timeout 25 ${runner} /workspace/${filename}`
-
-    const startTime = Date.now()
-
-    const { stdout, stderr } = await Promise.race([
-      execAsync(cmd, { maxBuffer: 5 * 1024 * 1024 }),
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new Error('TIMEOUT')), TIMEOUT_MS)
-      )
-    ])
-
-    const duration = Date.now() - startTime
-
-    // Collect any output files the code produced
-    const outputFiles = await collectOutputFiles(worker, jobId)
-
-    return { stdout, stderr, duration, outputFiles, exitCode: 0 }
-
-  } catch (err) {
-    if (err.message === 'TIMEOUT') {
-      return { error: 'Execution timed out', stdout: '', stderr: '', exitCode: 124 }
-    }
-    return {
-      stdout: err.stdout || '',
-      stderr: err.stderr || err.message,
-      exitCode: err.code || 1,
-      outputFiles: []
-    }
-  } finally {
-    markFree(worker)
-  }
-}
-
-async function collectOutputFiles(worker, jobId) {
-  try {
-    const { stdout } = await execAsync(
-      `docker exec ${worker.name} sh -c "ls /workspace/ 2>/dev/null"`
-    )
-
-    const files = stdout.trim().split('\n').filter(f =>
-      f && f !== 'main.py' && f !== 'main.js' && !f.endsWith('.pyc')
-    )
-
-    const result = []
-    for (const filename of files) {
-      try {
-        const tmpPath = `/tmp/execify-out-${jobId}-${filename}`
-        await execAsync(`docker cp ${worker.name}:/workspace/${filename} ${tmpPath}`)
-        const content = await fs.readFile(tmpPath)
-        result.push({
-          name: filename,
-          content: content.toString('base64'),
-          size: content.length
-        })
-        await fs.unlink(tmpPath)
-      } catch {}
-    }
-
-    return result
-  } catch {
-    return []
-  }
-}
-
-module.exports = { runCode }
-```
+1. Validate request shape and language.
+2. Acquire a free worker from the pool.
+3. Clean worker workspace.
+4. Validate file inputs and allowed input extensions.
+5. Copy input files and generated code file into worker.
+6. Preflight checks before actual execution:
+   - Python syntax: `python3 -m py_compile`
+   - Node syntax: `node --check`
+   - Python dependency probe: parse imports, `importlib.import_module`
+   - Node dependency probe: parse imports/requires, `require.resolve`
+7. Execute code with timeout.
+8. Collect output files filtered by allowed output extensions.
+9. Optionally persist output files on host disk.
+10. Return structured result with `errorType` and `retryable`.
 
 ---
 
-## Phase 4 — The command registry
+## 6. Error Classification Contract (Agent-Friendly)
 
-Commands are named operations that do not require the caller to write any code. The AI agent calls `fetch_url` or `write_file` by name, with parameters. Your server handles what actually happens.
+The executor returns deterministic failure types:
 
-Open `src/commands.js`:
+- `input_validation`: bad request/file shape or disallowed extension
+- `syntax_error`: code parse/compile error
+- `missing_dependency`: requested package/module not available in sandbox image
+- `runtime_error`: code executed but failed at runtime
+- `timeout`: execution exceeded limit
 
-```javascript
-const { exec } = require('child_process')
-const { promisify } = require('util')
-const fs = require('fs').promises
-const https = require('https')
-const http = require('http')
-const { getWorker, markBusy, markFree } = require('./pool')
+Retry guidance:
 
-const execAsync = promisify(exec)
+- `input_validation`, `syntax_error`, `missing_dependency` -> do not retry unchanged code
+- `runtime_error` -> retry optional (depends on agent strategy)
+- `timeout` -> retry allowed
 
-// Only these URLs can be fetched via fetch_url
-// Add to this list as needed
-const URL_WHITELIST = [
-  'https://api.github.com',
-  'https://jsonplaceholder.typicode.com',
-  // add your trusted domains here
-]
+HTTP behavior:
 
-function isWhitelisted(url) {
-  return URL_WHITELIST.some(allowed => url.startsWith(allowed))
-}
-
-const COMMANDS = {
-
-  fetch_url: async ({ url, method = 'GET', body = null, headers = {} }) => {
-    if (!isWhitelisted(url)) {
-      return { error: `URL not in whitelist: ${url}` }
-    }
-
-    return new Promise((resolve) => {
-      const lib = url.startsWith('https') ? https : http
-      const options = { method, headers: { 'User-Agent': 'Execify/1.0', ...headers } }
-
-      const req = lib.request(url, options, (res) => {
-        let data = ''
-        res.on('data', chunk => data += chunk)
-        res.on('end', () => resolve({
-          status: res.statusCode,
-          headers: res.headers,
-          body: data
-        }))
-      })
-
-      req.on('error', err => resolve({ error: err.message }))
-      if (body) req.write(typeof body === 'string' ? body : JSON.stringify(body))
-      req.end()
-    })
-  },
-
-  write_file: async ({ filename, content, encoding = 'utf8' }, worker) => {
-    if (!worker) return { error: 'No worker available' }
-    const tmpPath = `/tmp/execify-write-${Date.now()}-${filename}`
-    const data = encoding === 'base64'
-      ? Buffer.from(content, 'base64')
-      : Buffer.from(content, 'utf8')
-    await fs.writeFile(tmpPath, data)
-    await execAsync(`docker cp ${tmpPath} ${worker.name}:/workspace/${filename}`)
-    await fs.unlink(tmpPath)
-    return { success: true, filename }
-  },
-
-  read_file: async ({ filename }, worker) => {
-    if (!worker) return { error: 'No worker available' }
-    const tmpPath = `/tmp/execify-read-${Date.now()}-${filename}`
-    await execAsync(`docker cp ${worker.name}:/workspace/${filename} ${tmpPath}`)
-    const content = await fs.readFile(tmpPath)
-    await fs.unlink(tmpPath)
-    return {
-      filename,
-      content: content.toString('base64'),
-      size: content.length
-    }
-  },
-
-  list_dir: async ({}, worker) => {
-    if (!worker) return { error: 'No worker available' }
-    const { stdout } = await execAsync(
-      `docker exec ${worker.name} sh -c "ls -la /workspace/ 2>/dev/null"`
-    )
-    return { listing: stdout.trim() }
-  },
-
-  delete_file: async ({ filename }, worker) => {
-    if (!worker) return { error: 'No worker available' }
-    await execAsync(`docker exec ${worker.name} sh -c "rm -f /workspace/${filename}"`)
-    return { success: true, deleted: filename }
-  },
-
-  zip_files: async ({ filenames, output_name = 'output.zip' }, worker) => {
-    if (!worker) return { error: 'No worker available' }
-    const fileList = filenames.join(' ')
-    await execAsync(
-      `docker exec ${worker.name} sh -c "cd /workspace && zip ${output_name} ${fileList}"`
-    )
-    return { success: true, zip_file: output_name }
-  },
-
-  clear_workspace: async ({}, worker) => {
-    if (!worker) return { error: 'No worker available' }
-    await execAsync(`docker exec ${worker.name} sh -c "rm -rf /workspace/*"`)
-    return { success: true }
-  }
-
-}
-
-async function runCommand(commandName, params) {
-  const handler = COMMANDS[commandName]
-
-  if (!handler) {
-    return {
-      error: `Unknown command: ${commandName}`,
-      available: Object.keys(COMMANDS)
-    }
-  }
-
-  const needsWorker = ['write_file', 'read_file', 'list_dir',
-                        'delete_file', 'zip_files', 'clear_workspace']
-
-  let worker = null
-  if (needsWorker.includes(commandName)) {
-    worker = getWorker()
-    if (!worker) return { error: 'No workers available' }
-    markBusy(worker)
-  }
-
-  try {
-    const result = await handler(params, worker)
-    return result
-  } catch (err) {
-    return { error: err.message }
-  } finally {
-    if (worker) markFree(worker)
-  }
-}
-
-module.exports = { runCommand, COMMANDS }
-```
+- Non-retryable code/setup errors (`syntax_error`, `missing_dependency`, `input_validation`) return `422`.
 
 ---
 
-## Phase 5 — Auth middleware
+## 7. File Extension Control
 
-Simple API key check. Every request must include `X-API-Key` in the header.
+Extension allowlists are enforced from config/env:
 
-Open `.env`:
+- `ALLOWED_INPUT_EXTENSIONS`
+- `ALLOWED_OUTPUT_EXTENSIONS`
 
-```
-API_KEYS=key-abc123,key-def456
-PORT=3000
-```
-
-Open `src/auth.js`:
-
-```javascript
-require('dotenv').config()
-
-const validKeys = (process.env.API_KEYS || '').split(',').map(k => k.trim())
-
-function requireApiKey(req, res, next) {
-  const key = req.headers['x-api-key']
-
-  if (!key || !validKeys.includes(key)) {
-    return res.status(401).json({ error: 'Invalid or missing API key' })
-  }
-
-  next()
-}
-
-module.exports = { requireApiKey }
-```
+If an input file extension is not allowed, execution fails before run.
+If an output file extension is not allowed, file is ignored and not returned.
 
 ---
 
-## Phase 6 — The server
+## 8. Output Storage Behavior
 
-This is where everything connects. Open `src/server.js`:
+Default behavior:
 
-```javascript
-require('dotenv').config()
-const express = require('express')
-const { initPool } = require('./pool')
-const { runCode } = require('./executor')
-const { runCommand, COMMANDS } = require('./commands')
-const { requireApiKey } = require('./auth')
+- outputs are returned in API response as base64 in `outputFiles`
+- temporary host copies are deleted
+- nothing is persisted permanently
 
-const app = express()
-app.use(express.json({ limit: '10mb' }))
+Optional persistence:
 
-// Health check — no auth needed
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() })
-})
-
-// List available languages and commands — no auth needed
-app.get('/capabilities', (req, res) => {
-  res.json({
-    languages: ['python', 'node'],
-    commands: Object.keys(COMMANDS),
-    limits: {
-      timeout_seconds: 25,
-      max_memory_mb: 256,
-      max_file_size_mb: 10
-    }
-  })
-})
-
-// Main execution endpoint — auth required
-app.post('/run', requireApiKey, async (req, res) => {
-  const { type, language, code, files, command, params, timeout } = req.body
-
-  if (!type) {
-    return res.status(400).json({ error: 'Missing field: type (execute or command)' })
-  }
-
-  if (type === 'execute') {
-    if (!language || !['python', 'node'].includes(language)) {
-      return res.status(400).json({ error: 'language must be python or node' })
-    }
-    if (!code || typeof code !== 'string') {
-      return res.status(400).json({ error: 'Missing field: code' })
-    }
-    if (code.length > 100000) {
-      return res.status(400).json({ error: 'Code too large (max 100kb)' })
-    }
-
-    const result = await runCode(language, code, files || [])
-
-    if (result.status === 503) {
-      return res.status(503).json({ error: result.error })
-    }
-
-    return res.json(result)
-  }
-
-  if (type === 'command') {
-    if (!command) {
-      return res.status(400).json({ error: 'Missing field: command' })
-    }
-
-    const result = await runCommand(command, params || {})
-    return res.json(result)
-  }
-
-  return res.status(400).json({ error: 'type must be execute or command' })
-})
-
-const PORT = process.env.PORT || 3000
-
-async function start() {
-  await initPool()
-  app.listen(PORT, () => {
-    console.log(`Execify running on port ${PORT}`)
-  })
-}
-
-start()
-```
+- set `PERSIST_OUTPUTS=true`
+- set `PERSIST_OUTPUT_DIR`
+- outputs are saved under `PERSIST_OUTPUT_DIR/<jobId>/...`
 
 ---
 
-## Phase 7 — Test it locally
+## 9. Dependency Strategy (Important)
 
-Start the server:
+This platform is intentionally offline inside worker containers.
 
-```bash
-node src/server.js
-```
+That means:
 
-You should see the pool starting and then "Execify running on port 3000".
+- no dynamic `pip install` / `npm install` during execution jobs
+- dependencies must be preinstalled in the sandbox image (`docker/Dockerfile`)
+- if code asks for a package that is not present, return `missing_dependency` and let agent regenerate code
 
-Test the health endpoint:
-
-```bash
-curl http://localhost:3000/health
-```
-
-Test running Python code:
-
-```bash
-curl -X POST http://localhost:3000/run \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: key-abc123" \
-  -d '{
-    "type": "execute",
-    "language": "python",
-    "code": "print(\"hello from sandbox\")\nfor i in range(3):\n    print(i)"
-  }'
-```
-
-Test a command:
-
-```bash
-curl -X POST http://localhost:3000/run \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: key-abc123" \
-  -d '{
-    "type": "command",
-    "command": "list_dir",
-    "params": {}
-  }'
-```
-
-Test generating a file (Python writes a file, you get it back):
-
-```bash
-curl -X POST http://localhost:3000/run \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: key-abc123" \
-  -d '{
-    "type": "execute",
-    "language": "python",
-    "code": "f = open(\"hello.txt\", \"w\")\nf.write(\"this file was made inside the sandbox\")\nf.close()"
-  }'
-```
-
-The response will include `outputFiles` with `hello.txt` base64 encoded.
+This is the same practical pattern used by robust code-execution agents.
 
 ---
 
-## Phase 8 — Add the custom functions
+## 10. Command Registry Behavior
 
-These are fixed utility operations you build once on your server — not inside the sandbox, just regular Node.js endpoints. You mentioned converting docx to PDF as an example.
+Named commands are implemented in `src/commands.js`.
 
-Install LibreOffice on your host server (not in Docker) for this:
+Highlights:
 
-```bash
-sudo apt-get install libreoffice
-```
-
-Add a new endpoint in `server.js`:
-
-```javascript
-const { exec } = require('child_process')
-const { promisify } = require('util')
-const fs = require('fs').promises
-const execAsync = promisify(exec)
-
-app.post('/convert/docx-to-pdf', requireApiKey, async (req, res) => {
-  const { file, filename } = req.body
-
-  if (!file || !filename) {
-    return res.status(400).json({ error: 'Missing file or filename' })
-  }
-
-  const inputPath = `/tmp/convert-input-${Date.now()}-${filename}`
-  const outputDir = `/tmp/convert-output-${Date.now()}`
-
-  try {
-    await fs.mkdir(outputDir)
-    await fs.writeFile(inputPath, Buffer.from(file, 'base64'))
-
-    await execAsync(
-      `libreoffice --headless --convert-to pdf --outdir ${outputDir} ${inputPath}`
-    )
-
-    const pdfName = filename.replace(/\.docx$/i, '.pdf')
-    const pdfPath = `${outputDir}/${pdfName}`
-    const pdfContent = await fs.readFile(pdfPath)
-
-    res.json({
-      filename: pdfName,
-      content: pdfContent.toString('base64'),
-      size: pdfContent.length
-    })
-
-  } catch (err) {
-    res.status(500).json({ error: err.message })
-  } finally {
-    try {
-      await fs.unlink(inputPath)
-      await execAsync(`rm -rf ${outputDir}`)
-    } catch {}
-  }
-})
-```
-
-This is the pattern for any fixed utility. PDF to text, merge PDFs, compress an image — each one is a small endpoint like this. You write it once, it never changes.
+- `fetch_url` uses URL origin whitelist + method allowlist + timeout
+- file commands (`write_file`, `read_file`, `delete_file`, `zip_files`) sanitize names
+- workspace maintenance (`list_dir`, `clear_workspace`) runs against worker `/workspace`
 
 ---
 
-## Phase 9 — Deploy to a VPS
+## 11. API Endpoints
 
-Render works but for a project involving Docker-in-Docker you will have a smoother experience with a basic VPS. DigitalOcean, Hetzner, or Vultr all work. A $6/month droplet (1GB RAM) is fine for learning.
-
-**On your VPS:**
-
-```bash
-# Install Docker
-curl -fsSL https://get.docker.com | sh
-sudo usermod -aG docker $USER
-
-# Install Node
-curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
-sudo apt-get install -y nodejs
-
-# Install LibreOffice for doc conversion
-sudo apt-get install -y libreoffice
-
-# Clone your project
-git clone https://github.com/yourusername/execify.git
-cd execify
-
-# Install dependencies
-npm install
-
-# Build the sandbox image
-docker build -t execify-sandbox ./docker
-
-# Set up environment
-cp .env.example .env
-nano .env   # add your real API keys
-
-# Start it
-node src/server.js
-```
-
-To keep it running after you disconnect, use PM2:
-
-```bash
-npm install -g pm2
-pm2 start src/server.js --name execify
-pm2 startup    # makes it survive reboots
-pm2 save
-```
-
-**Set up HTTPS with nginx:**
-
-```bash
-sudo apt-get install -y nginx certbot python3-certbot-nginx
-
-# Point your domain to the VPS IP first, then:
-sudo certbot --nginx -d yourdomain.com
-```
-
-Create `/etc/nginx/sites-available/execify`:
-
-```nginx
-server {
-    listen 80;
-    server_name yourdomain.com;
-
-    location / {
-        proxy_pass http://localhost:3000;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        client_max_body_size 20M;
-    }
-}
-```
-
-```bash
-sudo ln -s /etc/nginx/sites-available/execify /etc/nginx/sites-enabled/
-sudo nginx -t
-sudo systemctl restart nginx
-```
-
-Certbot will handle the HTTPS certificate automatically.
+- `GET /health`: liveness
+- `GET /capabilities`: supported languages, commands, limits, extension policy, retry rules
+- `GET /installed-modules`: returns Python and Node module inventory from live worker (API key required)
+- `POST /run`: execute code or run command (API key required)
+- `POST /convert/docx-to-pdf`: host utility endpoint using LibreOffice (API key required)
 
 ---
 
-## What you have when you are done
+## 12. Environment Variables (Operational)
 
-A server running at `https://yourdomain.com` that accepts POST requests to `/run` with an API key. It can run Python or Node code in isolation, handle any of the named commands, convert docx to PDF, and return output files. Anything — your AI agent, a web app, a curl command from your laptop — can use it.
+Required:
 
-To add a new command you add one entry to the `COMMANDS` object in `commands.js` and one handler function. To add a new custom utility you add one endpoint. Nothing else changes.
+- `API_KEYS`
+- `PORT`
+
+Execution policy:
+
+- `ALLOWED_INPUT_EXTENSIONS`
+- `ALLOWED_OUTPUT_EXTENSIONS`
+- `PERSIST_OUTPUTS`
+- `PERSIST_OUTPUT_DIR`
+- `EXECUTION_TIMEOUT_SECONDS`
+- `EXECUTION_TIMEOUT_MS`
+- `MODULE_PROBE_TIMEOUT_MS`
+- `MODULE_LIST_MAX_ITEMS`
+- `CODE_MAX_CHARS`
+- `MAX_DOCKER_BUFFER_BYTES`
+
+Worker policy:
+
+- `POOL_SIZE`
+- `WORKER_MEMORY_MB`
+- `WORKER_CPUS`
+- `WORKER_TMPFS_MB`
+- `WORKSPACE_UID`
+- `WORKER_NETWORK_MODE`
+- `SANDBOX_IMAGE`
+
+Command policy:
+
+- `FETCH_TIMEOUT_MS`
+- `ALLOWED_HTTP_METHODS`
+- `URL_WHITELIST`
+
+---
+
+## 13. Deployment Notes
+
+- Build sandbox image once per dependency change.
+- Restart API service after `.env` or code/config updates.
+- Use process manager (`pm2`) and reverse proxy (`nginx`) for production.
+- Use HTTPS certificates (certbot/nginx) for public access.
+
+---
+
+## 14. Maintenance Workflow
+
+For policy updates:
+
+1. Update `src/config.js` defaults and/or `.env` values.
+2. Rebuild sandbox image only if runtime dependencies changed.
+3. Restart server.
+4. Check `GET /capabilities` to confirm effective policy.
+
+For agent compatibility checks:
+
+1. Call `GET /installed-modules` before generating code.
+2. Restrict generated imports to returned modules.
+3. If execution still returns `missing_dependency`, regenerate with available packages only.
+
+For new command:
+
+1. Add handler in `src/commands.js`.
+2. Keep filename/path safety rules.
+3. Return structured JSON result.
+
+For new host utility endpoint:
+
+1. Add endpoint in `src/server.js`.
+2. Validate input strictly.
+3. Use temp directory + cleanup.
