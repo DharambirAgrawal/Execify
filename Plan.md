@@ -202,7 +202,7 @@ Key decisions here: `--network none` means zero internet access inside the conta
 
 ## Phase 3 — The executor
 
-This is the core function. It takes code and a language, copies the code into the container, runs it, and returns what came out.
+This is the core function and It takes code and a language, copies the code into the container, runs it, and returns what came out.
 
 Open `src/executor.js`:
 
