@@ -127,7 +127,14 @@ curl http://localhost:3000/health
 GET /capabilities
 ```
 
-Returns supported languages, command names, and runtime limits.
+Returns supported languages, command names, runtime limits, retry rules, and host utility availability.
+
+Important fields for agent orchestration:
+
+- `commands`: exact command allowlist
+- `retry_rules`: deterministic retry guidance per error class
+- `host_utilities.docx_to_pdf_available`: whether conversion dependency exists
+- `host_utilities.docx_to_pdf_binary`: detected converter binary (`libreoffice` or `soffice`)
 
 ### 3) Main Execution Endpoint (Auth Required)
 
@@ -236,6 +243,8 @@ Defined in `src/commands.js`:
 - `zip_files`
 - `clear_workspace`
 
+Command file operations are extension-restricted using policy allowlists. Unsafe file types (for example `.sh`) are rejected.
+
 ## Authentication
 
 Every protected endpoint requires:
@@ -266,7 +275,9 @@ You can add a host-side endpoint (outside sandbox) for file conversion:
 POST /convert/docx-to-pdf
 ```
 
-Requires LibreOffice installed on host machine.
+Requires LibreOffice (or `soffice`) installed on host machine.
+
+If converter is unavailable, endpoint returns `503` with a clear error message.
 
 Ubuntu/Debian install:
 
@@ -316,6 +327,25 @@ Use Nginx + Certbot for HTTPS termination and reverse proxy.
 - `Execution timed out`: optimize code or raise timeout safely
 - `Invalid or missing API key`: verify `X-API-Key` and `.env`
 - Docker command failures: ensure Docker daemon is running and image is built
+- `DOCX to PDF conversion unavailable`: install LibreOffice on host, then restart service
+
+## Testing
+
+Run full test stack:
+
+```bash
+bash tests/run-all-tests.sh
+```
+
+Current suites:
+
+- Unit execution tests
+- Integration tests (file I/O)
+- Integration tests (named commands)
+- Security hardening tests
+- LeetCode-style algorithm tests
+- Complex/stress algorithm tests (CPU/memory boundaries)
+- Document generation tests
 
 ## Roadmap Ideas
 

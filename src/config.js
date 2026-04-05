@@ -51,7 +51,8 @@ const config = {
     tmpfsSizeMb: Number(process.env.WORKER_TMPFS_MB || 100),
     workspaceUid: Number(process.env.WORKSPACE_UID || 1001),
     networkMode: process.env.WORKER_NETWORK_MODE || 'none',
-    image: process.env.SANDBOX_IMAGE || 'execify-sandbox'
+    image: process.env.SANDBOX_IMAGE || 'execify-sandbox',
+    readOnly: String(process.env.WORKER_READONLY || 'false').toLowerCase() === 'true'
   },
   commands: {
     fetchTimeoutMs: Number(process.env.FETCH_TIMEOUT_MS || 10000),

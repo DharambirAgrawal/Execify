@@ -1,8 +1,6 @@
 // Commands are named operations that do not require the caller to write code.
 const { execFile } = require('child_process')
 const { promisify } = require('util')
-const fs = require('fs').promises
-const os = require('os')
 const path = require('path')
 const https = require('https')
 const http = require('http')
@@ -14,6 +12,10 @@ const execFileAsync = promisify(execFile)
 const SAFE_FILENAME_RE = config.SAFE_FILENAME_RE
 const FETCH_TIMEOUT_MS = config.commands.fetchTimeoutMs
 const ALLOWED_HTTP_METHODS = new Set(config.commands.allowedHttpMethods)
+const ALLOWED_COMMAND_FILE_EXTENSIONS = new Set([
+  ...config.execution.allowedInputExtensions,
+  ...config.execution.allowedOutputExtensions
+])
 
 function sanitizeFilename(rawName) {
   if (typeof rawName !== 'string') {
@@ -28,12 +30,30 @@ function sanitizeFilename(rawName) {
   return filename
 }
 
-function getTempPath(prefix) {
-  return path.join(os.tmpdir(), `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`)
-}
-
 async function dockerExec(args) {
   return execFileAsync('docker', args, { maxBuffer: config.execution.maxDockerBufferBytes })
+}
+
+async function writeFileToContainer(worker, filename, dataBuffer) {
+  const base64 = dataBuffer.toString('base64')
+  await dockerExec([
+    'exec',
+    worker.name,
+    'bash',
+    '-c',
+    `echo '${base64}' | base64 -d > /workspace/${filename}`
+  ])
+}
+
+async function readFileFromContainer(worker, filename) {
+  const { stdout } = await dockerExec([
+    'exec',
+    worker.name,
+    'bash',
+    '-c',
+    `base64 -w 0 /workspace/${filename}`
+  ])
+  return Buffer.from(String(stdout).trim(), 'base64')
 }
 
 // Only these URLs can be fetched via fetch_url
@@ -48,6 +68,17 @@ function isWhitelisted(url) {
     return URL_WHITELIST.has(parsed.origin)
   } catch {
     return false
+  }
+}
+
+function getExtension(filename) {
+  return path.extname(filename || '').toLowerCase()
+}
+
+function ensureAllowedCommandExtension(filename) {
+  const ext = getExtension(filename)
+  if (!ext || !ALLOWED_COMMAND_FILE_EXTENSIONS.has(ext)) {
+    throw new Error(`Extension not allowed for command file: ${ext || '(none)'}`)
   }
 }
 
@@ -93,23 +124,26 @@ const COMMANDS = {
   write_file: async ({ filename, content, encoding = 'utf8' }, worker) => {
     if (!worker) return { error: 'No worker available' }
     const safeFilename = sanitizeFilename(filename)
-    const tmpPath = getTempPath('execify-write')
+    ensureAllowedCommandExtension(safeFilename)
+
+    if (typeof content !== 'string') {
+      return { error: 'content must be a string' }
+    }
+
     const data = encoding === 'base64'
       ? Buffer.from(content, 'base64')
       : Buffer.from(content, 'utf8')
-    await fs.writeFile(tmpPath, data)
-    await dockerExec(['cp', tmpPath, `${worker.name}:/workspace/${safeFilename}`])
-    await fs.unlink(tmpPath)
+
+    await writeFileToContainer(worker, safeFilename, data)
     return { success: true, filename: safeFilename }
   },
 
   read_file: async ({ filename }, worker) => {
     if (!worker) return { error: 'No worker available' }
     const safeFilename = sanitizeFilename(filename)
-    const tmpPath = getTempPath('execify-read')
-    await dockerExec(['cp', `${worker.name}:/workspace/${safeFilename}`, tmpPath])
-    const content = await fs.readFile(tmpPath)
-    await fs.unlink(tmpPath)
+    ensureAllowedCommandExtension(safeFilename)
+
+    const content = await readFileFromContainer(worker, safeFilename)
     return {
       filename: safeFilename,
       content: content.toString('base64'),
@@ -126,6 +160,7 @@ const COMMANDS = {
   delete_file: async ({ filename }, worker) => {
     if (!worker) return { error: 'No worker available' }
     const safeFilename = sanitizeFilename(filename)
+    ensureAllowedCommandExtension(safeFilename)
     await dockerExec(['exec', worker.name, 'rm', '-f', `/workspace/${safeFilename}`])
     return { success: true, deleted: safeFilename }
   },
@@ -137,7 +172,9 @@ const COMMANDS = {
     }
 
     const safeOutputName = sanitizeFilename(output_name)
+    ensureAllowedCommandExtension(safeOutputName)
     const safeFiles = filenames.map(sanitizeFilename)
+    safeFiles.forEach(ensureAllowedCommandExtension)
 
     await dockerExec([
       'exec',

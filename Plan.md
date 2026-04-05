@@ -172,6 +172,7 @@ Highlights:
 
 - `fetch_url` uses URL origin whitelist + method allowlist + timeout
 - file commands (`write_file`, `read_file`, `delete_file`, `zip_files`) sanitize names
+- command file operations enforce extension policy allowlists (unsafe extensions rejected)
 - workspace maintenance (`list_dir`, `clear_workspace`) runs against worker `/workspace`
 
 ---
@@ -183,6 +184,11 @@ Highlights:
 - `GET /installed-modules`: returns Python and Node module inventory from live worker (API key required)
 - `POST /run`: execute code or run command (API key required)
 - `POST /convert/docx-to-pdf`: host utility endpoint using LibreOffice (API key required)
+
+### Conversion availability contract
+
+- `GET /capabilities` exposes `host_utilities.docx_to_pdf_available` and `host_utilities.docx_to_pdf_binary`.
+- If converter dependency is missing, `POST /convert/docx-to-pdf` returns `503` with explicit error.
 
 ---
 
@@ -259,3 +265,21 @@ For new host utility endpoint:
 1. Add endpoint in `src/server.js`.
 2. Validate input strictly.
 3. Use temp directory + cleanup.
+
+---
+
+## 15. Validation Matrix (Current)
+
+Validated with automated tests in `tests/`:
+
+- Unit: core Python/Node execution behavior.
+- Integration (file I/O): output file generation, read paths, zip paths.
+- Integration (commands): `fetch_url`, `write_file`, `read_file`, `list_dir`, `delete_file`, `zip_files`, `clear_workspace`.
+- Security: timeout kill, readonly enforcement, network isolation, privilege escalation blocking, memory limits.
+- Algorithms (standard): LeetCode-style array/string/sort/search/math coverage.
+- Algorithms (complex/stress): dynamic programming, graph shortest path, CPU-heavy finite workload, plus timeout/memory boundary checks.
+- Documents: txt/json/csv/md/docx/zip generation workflow.
+
+Known environment dependency:
+
+- DOCX -> PDF requires host LibreOffice/soffice binary. Endpoint is safe-fail with explicit `503` until dependency is installed.

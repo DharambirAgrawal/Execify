@@ -38,6 +38,15 @@ function classifyExecutionError(err) {
   const message = String(err?.message || '')
   const combined = `${stderr}\n${message}`
 
+  // GNU timeout exits with 124 when child exceeds time budget.
+  if (Number(err?.code) === 124 || /\bexit code 124\b|\btimeout\b/i.test(combined)) {
+    return {
+      errorType: 'timeout',
+      retryable: true,
+      userMessage: 'Execution timed out'
+    }
+  }
+
   if (/Input extension not allowed|Invalid input file name|Each input file must be an object|files must be an array|Invalid content for file/.test(combined)) {
     return {
       errorType: 'input_validation',
@@ -224,6 +233,22 @@ async function dockerExec(args) {
   return execFileAsync('docker', args, { maxBuffer: config.execution.maxDockerBufferBytes })
 }
 
+async function writeFileToContainer(worker, filename, content) {
+  // content should be a Buffer or string
+  const buffer = Buffer.isBuffer(content) ? content : Buffer.from(content, 'utf-8')
+  const base64 = buffer.toString('base64')
+  
+  // Use docker exec to write the file by decoding base64 inside the container
+  // This works with tmpfs mounts unlike docker cp
+  await dockerExec([
+    'exec',
+    worker.name,
+    'bash',
+    '-c',
+    `echo '${base64}' | base64 -d > /workspace/${filename}`
+  ])
+}
+
 async function runCode(language, code, inputFiles = []) {
   const worker = getWorker()
 
@@ -256,18 +281,12 @@ async function runCode(language, code, inputFiles = []) {
       }
 
       const content = Buffer.from(file.content, 'base64')
-      const tmpPath = getTempPath(`execify-upload-${jobId}`)
-      await fs.writeFile(tmpPath, content)
-      await dockerExec(['cp', tmpPath, `${worker.name}:/workspace/${safeName}`])
-      await fs.unlink(tmpPath)
+      await writeFileToContainer(worker, safeName, content)
     }
 
     // Write the code file
     const filename = language === 'python' ? 'main.py' : 'main.js'
-    const tmpCodePath = getTempPath(`execify-code-${jobId}`)
-    await fs.writeFile(tmpCodePath, code)
-    await dockerExec(['cp', tmpCodePath, `${worker.name}:/workspace/${filename}`])
-    await fs.unlink(tmpCodePath)
+    await writeFileToContainer(worker, filename, code)
 
     await preflightCheck(language, worker, filename, code)
 
@@ -354,15 +373,20 @@ async function collectOutputFiles(worker, jobId) {
     const result = []
     for (const filename of files) {
       try {
-        const tmpPath = getTempPath(`execify-out-${jobId}`)
-        await dockerExec(['cp', `${worker.name}:/workspace/${filename}`, tmpPath])
-        const content = await fs.readFile(tmpPath)
+        const { stdout: fileContent } = await dockerExec([
+          'exec',
+          worker.name,
+          'bash',
+          '-c',
+          `base64 -w 0 /workspace/${filename}`
+        ])
+
+        const content = Buffer.from(String(fileContent).trim(), 'base64')
         result.push({
           name: filename,
           content: content.toString('base64'),
           size: content.length
         })
-        await fs.unlink(tmpPath)
       } catch {}
     }
 

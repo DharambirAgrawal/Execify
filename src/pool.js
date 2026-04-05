@@ -13,13 +13,14 @@ async function startContainer(id) {
     execSync(`docker rm -f ${name}`, { stdio: 'ignore' })
   } catch {}
 
+  const readOnlyFlag = config.workerPool.readOnly ? '--read-only' : ''
   await execAsync(`
     docker run -d \
       --name ${name} \
       --network ${config.workerPool.networkMode} \
       --memory ${config.workerPool.memoryMb}m \
       --cpus ${config.workerPool.cpus} \
-      --read-only \
+      ${readOnlyFlag} \
       --tmpfs /workspace:size=${config.workerPool.tmpfsSizeMb}m,uid=${config.workerPool.workspaceUid} \
       --user ${config.workerPool.workspaceUid} \
       ${config.workerPool.image}

@@ -13,6 +13,7 @@ const config = require('./config')
 
 const execFileAsync = promisify(execFile)
 const SAFE_FILENAME_RE = config.SAFE_FILENAME_RE
+let docxConverterBinary = null
 
 async function dockerExec(args) {
   return execFileAsync('docker', args, {
@@ -50,6 +51,16 @@ function sanitizeDocxFilename(rawName) {
   return fileName
 }
 
+async function detectDocxConverterBinary() {
+  for (const candidate of ['libreoffice', 'soffice']) {
+    try {
+      await execFileAsync(candidate, ['--version'])
+      return candidate
+    } catch {}
+  }
+  return null
+}
+
 const app = express()
 app.use(express.json({ limit: config.app.requestBodyLimit }))
 
@@ -69,6 +80,10 @@ app.get('/capabilities', (req, res) => {
         run: '/run',
         module_inventory: '/installed-modules',
         convert_docx_to_pdf: '/convert/docx-to-pdf'
+      },
+      host_utilities: {
+        docx_to_pdf_available: Boolean(docxConverterBinary),
+        docx_to_pdf_binary: docxConverterBinary
       },
     limits: {
         timeout_seconds: config.execution.timeoutSeconds,
@@ -102,13 +117,13 @@ app.get('/installed-modules', requireApiKey, async (req, res) => {
       'import json, pkgutil',
       'mods = sorted({m.name.split(".")[0] for m in pkgutil.iter_modules()})',
       'print(json.dumps(mods))'
-    ].join(';')
+    ].join('\n')
 
     const nodeBuiltinScript = [
       'const { builtinModules } = require("module")',
       'const mods = Array.from(new Set(builtinModules.map(m => m.replace(/^node:/, "")))).sort()',
       'process.stdout.write(JSON.stringify(mods))'
-    ].join(';')
+    ].join('\n')
 
     const pythonResult = await dockerExecWithTimeout(
       ['exec', worker.name, 'python3', '-c', pythonScript],
@@ -219,6 +234,10 @@ app.post('/convert/docx-to-pdf', requireApiKey, async (req, res) => {
     return res.status(400).json({ error: 'Missing file or filename' })
   }
 
+  if (!docxConverterBinary) {
+    return res.status(503).json({ error: 'DOCX to PDF conversion unavailable: libreoffice/soffice not installed on host' })
+  }
+
   let tempDir = ''
 
   try {
@@ -228,7 +247,7 @@ app.post('/convert/docx-to-pdf', requireApiKey, async (req, res) => {
     const inputPath = path.join(tempDir, safeFilename)
     await fs.writeFile(inputPath, Buffer.from(file, 'base64'))
 
-    await execFileAsync('libreoffice', [
+    await execFileAsync(docxConverterBinary, [
       '--headless',
       '--convert-to',
       'pdf',
@@ -260,6 +279,11 @@ app.post('/convert/docx-to-pdf', requireApiKey, async (req, res) => {
 const PORT = config.app.port
 
 async function start() {
+  docxConverterBinary = await detectDocxConverterBinary()
+  if (!docxConverterBinary) {
+    console.warn('DOCX converter unavailable: install libreoffice (or soffice) to enable /convert/docx-to-pdf')
+  }
+
   await initPool()
   app.listen(PORT, () => {
     console.log(`Execify running on port ${PORT}`)
