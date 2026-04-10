@@ -517,6 +517,14 @@ app.post('/convert/docx-to-pdf', requireApiKey, async (req, res) => {
     return res.status(503).json({ error: 'DOCX to PDF conversion unavailable: libreoffice/soffice not installed in the sandbox image' })
   }
 
+  let safeFilename
+  try {
+    safeFilename = sanitizeDocxFilename(filename)
+  } catch (err) {
+    recordUsage(req.apiKey, { kind: 'conversion', durationMs: Date.now() - startedAt, status: 400 })
+    return res.status(400).json({ error: err.message })
+  }
+
   const worker = getWorker()
   if (!worker) {
     recordUsage(req.apiKey, { kind: 'conversion', durationMs: Date.now() - startedAt, status: 503 })
@@ -526,7 +534,6 @@ app.post('/convert/docx-to-pdf', requireApiKey, async (req, res) => {
   markBusy(worker)
 
   try {
-    const safeFilename = sanitizeDocxFilename(filename)
     const pdfName = safeFilename.replace(/\.docx$/i, '.pdf')
 
     await cleanWorkerWorkspace(worker)

@@ -201,6 +201,7 @@ async function runCommand(commandName, params, workerOverride = null) {
 
   if (!handler) {
     return {
+      status: 400,
       error: `Unknown command: ${commandName}`,
       available: Object.keys(COMMANDS)
     }
@@ -222,11 +223,14 @@ async function runCommand(commandName, params, workerOverride = null) {
 
   try {
     const result = await handler(params, worker)
+    if (result && result.error && !result.status) {
+      return { ...result, status: 400 }
+    }
     return result
   } catch (err) {
-    return { error: err.message }
+    return { status: 400, error: err.message }
   } finally {
-    if (worker) markFree(worker)
+    if (manageWorker && worker) markFree(worker)
   }
 }
 
