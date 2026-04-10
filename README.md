@@ -11,6 +11,13 @@ Execify provides two execution modes through one endpoint:
 - `execute`: run arbitrary `python` or `node` code in an isolated container.
 - `command`: run named operations like `fetch_url`, `write_file`, `read_file`, `zip_files`, and more.
 
+Version 2 adds the pieces needed for multi-step agent workflows:
+
+- `session` workspaces that persist across multiple `/run` calls
+- streaming execution via `/run/stream`
+- per-API-key usage tracking at `/usage`
+- DOCX to PDF conversion inside the sandbox container
+
 Each job executes in a pooled sandbox worker with strict limits:
 
 - no internet by default in workers (`--network none`)
@@ -25,6 +32,8 @@ Each job executes in a pooled sandbox worker with strict limits:
 - `src/executor.js`: language execution flow (`python`/`node`)
 - `src/commands.js`: command registry and handlers
 - `src/auth.js`: API key middleware (`X-API-Key`)
+- `src/sessionManager.js`: persistent session workspace lifecycle
+- `src/usageTracker.js`: in-memory usage log by API key
 - `src/output.js`: output encoding/collection utilities (reserved)
 - `docker/Dockerfile`: sandbox runtime image
 - `workspace/`: temporary local job artifacts (if used)
@@ -35,9 +44,11 @@ Each job executes in a pooled sandbox worker with strict limits:
 - Docker Desktop / Docker Engine
 - Git
 
-Optional (for host utility endpoint `docx -> pdf`):
+Optional (for the DOCX conversion endpoint):
 
 - LibreOffice
+
+The sandbox image now installs LibreOffice too, so the conversion endpoint runs inside the container instead of on the host.
 
 Verify tools:
 
@@ -80,6 +91,9 @@ PERSIST_OUTPUTS=false
 PERSIST_OUTPUT_DIR=workspace/jobs
 MODULE_PROBE_TIMEOUT_MS=15000
 MODULE_LIST_MAX_ITEMS=2000
+SESSION_TTL_SECONDS=3600
+SESSION_MAX_TTL_SECONDS=86400
+USAGE_LOG_MAX_EVENTS=200
 ```
 
 `API_KEYS` is a comma-separated list of allowed request keys.
@@ -159,6 +173,49 @@ For execute requests, responses include deterministic error metadata:
 
 `retryable` is returned as a boolean for agent logic.
 
+### 3b) Session Workspaces (Auth Required)
+
+Create a persistent workspace:
+
+```http
+POST /session/create
+```
+
+Example response:
+
+```json
+{
+	"session_id": "abc123",
+	"expires_in": 3600,
+	"expires_at": "2026-04-09T12:00:00.000Z",
+	"worker": "execify-worker-0"
+}
+```
+
+Use `session_id` on later `/run` or `/run/stream` calls to keep the same container workspace alive between steps.
+
+Delete it explicitly when done:
+
+```http
+DELETE /session/abc123
+```
+
+### 3c) Streaming Execution (Auth Required)
+
+```http
+GET /run/stream?payload={...}
+```
+
+The server emits Server-Sent Events with stdout lines as they arrive and a final `done` event when the job finishes.
+
+### 3d) Usage Tracking (Auth Required)
+
+```http
+GET /usage
+```
+
+Returns per-key request counts, total duration, and recent run records.
+
 ### 4) Installed Modules Endpoint (Auth Required)
 
 ```http
@@ -172,6 +229,10 @@ Returns module inventory from a live worker:
 - Node: builtin modules + global npm packages
 
 Use this endpoint before code generation so your AI agent can avoid unsupported libraries.
+
+### 5) DOCX Conversion (Auth Required)
+
+`POST /convert/docx-to-pdf` now runs LibreOffice inside the sandbox worker, so DOCX generation and PDF conversion can happen in one job or one session workspace.
 
 ## Usage Examples
 

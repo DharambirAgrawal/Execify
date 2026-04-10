@@ -8,6 +8,9 @@ Execify is a sandboxed code execution service with support for Python and Node.j
 - Module inventory
 - Document conversion (DOCX → PDF)
 - Health checks and capabilities
+- Session workspaces for multi-step jobs
+- Streaming output for long-running runs
+- Per-API-key usage tracking
 
 ## Authentication
 
@@ -58,8 +61,18 @@ Response:
   ],
   "endpoints": {
     "run": "/run",
+    "run_stream": "/run/stream",
+    "session_create": "/session/create",
+    "session_delete": "/session/:session_id",
+    "usage": "/usage",
     "module_inventory": "/installed-modules",
     "convert_docx_to_pdf": "/convert/docx-to-pdf"
+  },
+  "features": {
+    "session_workspaces": true,
+    "streaming_output": true,
+    "usage_tracking": true,
+    "container_docx_conversion": true
   },
   "limits": {
     "timeout_seconds": 25,
@@ -165,6 +178,59 @@ Execute Python or Node.js code with optional input files.
   "retryable": true
 }
 ```
+
+### 3b. Session Workspaces
+
+**POST** `/session/create` (Auth required)
+
+Create a persistent workspace backed by a reserved worker container.
+
+```bash
+curl -X POST http://localhost:3000/session/create \
+	-H "X-API-Key: test-key-123" \
+	-H "Content-Type: application/json" \
+	-d '{"expires_in":3600}'
+```
+
+Response:
+
+```json
+{
+  "session_id": "abc123",
+  "expires_in": 3600,
+  "expires_at": "2026-04-09T12:00:00.000Z",
+  "worker": "execify-worker-0"
+}
+```
+
+Use `session_id` on later `/run` or `/run/stream` calls to keep `/workspace` intact between steps.
+
+**DELETE** `/session/:session_id` (Auth required)
+
+Deletes the session and frees the worker.
+
+### 3c. Streaming Execution
+
+**GET** `/run/stream` or **POST** `/run/stream` (Auth required)
+
+Returns a Server-Sent Events stream with stdout/stderr lines as they arrive and a final `done` event.
+
+Example request body for POST:
+
+```json
+{
+  "type": "execute",
+  "language": "python",
+  "code": "import time\nfor i in range(3):\n    print(f'row {i}')\n    time.sleep(1)",
+  "session_id": "abc123"
+}
+```
+
+### 3d. Usage Tracking
+
+**GET** `/usage` (Auth required)
+
+Returns a per-key summary with total requests, total duration, and recent requests.
 
 ---
 
@@ -340,6 +406,10 @@ Response:
 ### 6. DOCX to PDF Conversion
 
 **POST** `/convert/docx-to-pdf` (Auth required)
+
+Container-backed DOCX to PDF conversion.
+
+Runs LibreOffice inside the sandbox worker instead of on the host.
 
 Convert DOCX document to PDF using LibreOffice.
 

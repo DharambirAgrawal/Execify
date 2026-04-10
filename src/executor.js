@@ -1,6 +1,6 @@
 // This is the core function and It takes code and a language, copies the code into the container, runs it, and returns what came out.
 
-const { execFile } = require('child_process')
+const { execFile, spawn } = require('child_process')
 const { promisify } = require('util')
 const fs = require('fs').promises
 const fsSync = require('fs')
@@ -233,6 +233,83 @@ async function dockerExec(args) {
   return execFileAsync('docker', args, { maxBuffer: config.execution.maxDockerBufferBytes })
 }
 
+function createLineSplitter(onLine) {
+  let pending = ''
+
+  return {
+    push(chunk) {
+      pending += chunk.toString('utf8')
+
+      let newlineIndex = pending.indexOf('\n')
+      while (newlineIndex !== -1) {
+        const line = pending.slice(0, newlineIndex).replace(/\r$/, '')
+        onLine(line)
+        pending = pending.slice(newlineIndex + 1)
+        newlineIndex = pending.indexOf('\n')
+      }
+    },
+    flush() {
+      if (pending.length > 0) {
+        onLine(pending.replace(/\r$/, ''))
+        pending = ''
+      }
+    }
+  }
+}
+
+async function runDockerProcess(args, { onStdoutLine, onStderrLine } = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn('docker', args, { stdio: ['ignore', 'pipe', 'pipe'] })
+    const stdoutSplitter = createLineSplitter(typeof onStdoutLine === 'function' ? onStdoutLine : () => {})
+    const stderrSplitter = createLineSplitter(typeof onStderrLine === 'function' ? onStderrLine : () => {})
+    let stdout = ''
+    let stderr = ''
+    let settled = false
+
+    const timeoutId = setTimeout(() => {
+      if (settled) {
+        return
+      }
+
+      settled = true
+      child.kill('SIGKILL')
+      reject(new Error('TIMEOUT'))
+    }, TIMEOUT_MS)
+
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk.toString('utf8')
+      stdoutSplitter.push(chunk)
+    })
+
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString('utf8')
+      stderrSplitter.push(chunk)
+    })
+
+    child.on('error', (err) => {
+      if (settled) {
+        return
+      }
+
+      settled = true
+      clearTimeout(timeoutId)
+      reject(err)
+    })
+
+    child.on('close', (code, signal) => {
+      if (settled) {
+        return
+      }
+
+      settled = true
+      clearTimeout(timeoutId)
+      stdoutSplitter.flush()
+      stderrSplitter.flush()
+      resolve({ stdout, stderr, code, signal })
+    })
+  })
+}
+
 async function writeFileToContainer(worker, filename, content) {
   // content should be a Buffer or string
   const buffer = Buffer.isBuffer(content) ? content : Buffer.from(content, 'utf-8')
@@ -249,18 +326,23 @@ async function writeFileToContainer(worker, filename, content) {
   ])
 }
 
-async function runCode(language, code, inputFiles = []) {
-  const worker = getWorker()
+async function executeCode(language, code, inputFiles = [], options = {}) {
+  const worker = options.worker || getWorker()
 
   if (!worker) {
     return { error: 'All workers busy, try again shortly', status: 503 }
   }
 
-  markBusy(worker)
+  const manageWorker = !options.worker
+  if (manageWorker) {
+    markBusy(worker)
+  }
   const jobId = uuidv4()
 
   try {
-    await cleanWorkerWorkspace(worker)
+    if (options.resetWorkspace !== false) {
+      await cleanWorkerWorkspace(worker)
+    }
 
     if (!Array.isArray(inputFiles)) {
       throw new Error('files must be an array')
@@ -291,26 +373,58 @@ async function runCode(language, code, inputFiles = []) {
     await preflightCheck(language, worker, filename, code)
 
     // Run it
-    const runner = language === 'python' ? 'python3' : 'node'
+    const runner = language === 'python' ? ['python3', '-u'] : ['node']
 
     const startTime = Date.now()
 
-    const { stdout, stderr } = await Promise.race([
-        dockerExec(['exec', worker.name, 'timeout', String(config.execution.timeoutSeconds), runner, `/workspace/${filename}`]),
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new Error('TIMEOUT')), TIMEOUT_MS)
-      )
-    ])
+    const execution = await runDockerProcess(
+      ['exec', worker.name, 'timeout', String(config.execution.timeoutSeconds), ...runner, `/workspace/${filename}`],
+      {
+        onStdoutLine: options.onStdoutLine,
+        onStderrLine: options.onStderrLine
+      }
+    )
 
     const duration = Date.now() - startTime
+
+    if (execution.code && execution.code !== 0) {
+      if (execution.code === 124) {
+        return {
+          error: 'Execution timed out',
+          stdout: execution.stdout,
+          stderr: execution.stderr,
+          exitCode: 124,
+          errorType: 'timeout',
+          retryable: true,
+          outputFiles: []
+        }
+      }
+
+      const classified = classifyExecutionError({
+        code: execution.code,
+        stdout: execution.stdout,
+        stderr: execution.stderr,
+        message: execution.stderr || `Process exited with code ${execution.code}`
+      })
+
+      return {
+        error: classified.userMessage,
+        stdout: execution.stdout,
+        stderr: execution.stderr,
+        exitCode: execution.code,
+        outputFiles: [],
+        errorType: classified.errorType,
+        retryable: classified.retryable
+      }
+    }
 
     // Collect any output files the code produced
     const outputFiles = await collectOutputFiles(worker, jobId)
     const persistedPath = await persistOutputFiles(jobId, outputFiles)
 
     return {
-      stdout,
-      stderr,
+      stdout: execution.stdout,
+      stderr: execution.stderr,
       duration,
       outputFiles,
       persistedOutputPath: persistedPath,
@@ -343,8 +457,18 @@ async function runCode(language, code, inputFiles = []) {
       retryable: classified.retryable
     }
   } finally {
-    markFree(worker)
+    if (manageWorker) {
+      markFree(worker)
+    }
   }
+}
+
+async function runCode(language, code, inputFiles = [], options = {}) {
+  return executeCode(language, code, inputFiles, options)
+}
+
+async function runCodeStream(language, code, inputFiles = [], options = {}) {
+  return executeCode(language, code, inputFiles, options)
 }
 
 async function collectOutputFiles(worker, jobId) {
@@ -396,4 +520,4 @@ async function collectOutputFiles(worker, jobId) {
   }
 }
 
-module.exports = { runCode, getExecutionPolicy }
+module.exports = { runCode, runCodeStream, getExecutionPolicy }

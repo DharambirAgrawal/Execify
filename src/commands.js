@@ -196,7 +196,7 @@ const COMMANDS = {
 
 }
 
-async function runCommand(commandName, params) {
+async function runCommand(commandName, params, workerOverride = null) {
   const handler = COMMANDS[commandName]
 
   if (!handler) {
@@ -210,10 +210,14 @@ async function runCommand(commandName, params) {
                         'delete_file', 'zip_files', 'clear_workspace']
 
   let worker = null
-  if (needsWorker.includes(commandName)) {
+  const manageWorker = !workerOverride && needsWorker.includes(commandName)
+
+  if (manageWorker) {
     worker = getWorker()
     if (!worker) return { error: 'No workers available' }
     markBusy(worker)
+  } else if (workerOverride) {
+    worker = workerOverride
   }
 
   try {

@@ -44,6 +44,13 @@ const config = {
     persistOutputs: String(process.env.PERSIST_OUTPUTS || 'false').toLowerCase() === 'true',
     persistOutputDir: process.env.PERSIST_OUTPUT_DIR || path.join(process.cwd(), 'workspace', 'jobs')
   },
+  session: {
+    defaultTtlSeconds: Number(process.env.SESSION_TTL_SECONDS || 3600),
+    maxTtlSeconds: Number(process.env.SESSION_MAX_TTL_SECONDS || 86400)
+  },
+  usage: {
+    maxRecentEventsPerKey: Number(process.env.USAGE_LOG_MAX_EVENTS || 200)
+  },
   workerPool: {
     size: Number(process.env.POOL_SIZE || 3),
     memoryMb: Number(process.env.WORKER_MEMORY_MB || 256),

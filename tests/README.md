@@ -56,6 +56,11 @@ chmod +x tests/integration/file-operations.test.sh
 - ZIP: Create archives
 - Cleanup: Delete files
 
+Additional v2 integration coverage:
+- Persistent session workspaces across multiple `/run` calls
+- Streaming output from `/run/stream`
+- Per-key usage summary from `/usage`
+
 #### 3. Security Tests (Readonly Hardening)
 ```bash
 chmod +x tests/security/readonly-hardening.test.sh

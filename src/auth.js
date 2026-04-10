@@ -11,6 +11,7 @@ function requireApiKey(req, res, next) {
     return res.status(401).json({ error: 'Invalid or missing API key' })
   }
 
+  req.apiKey = key
   next()
 }
 

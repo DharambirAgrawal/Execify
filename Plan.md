@@ -11,6 +11,9 @@ Build a Node.js HTTP service that can:
 - run named commands (`fetch_url`, `write_file`, `zip_files`, etc.)
 - return logs and generated files
 - classify failures so an AI agent knows whether to retry
+- keep a worker alive across multiple steps when a session workspace is requested
+- stream output during long jobs
+- track usage per API key for operational visibility
 
 The service is API-key protected and designed for agent usage.
 
@@ -29,6 +32,8 @@ Execify/
 │   ├── executor.js        # code execution + preflight + output handling
 │   ├── commands.js        # named command handlers
 │   ├── auth.js            # API key middleware
+│   ├── sessionManager.js  # session workspace lifecycle
+│   ├── usageTracker.js    # in-memory usage log per API key
 │   ├── queue.js           # in-memory queue utility
 │   └── output.js          # output helper utilities
 ├── docker/
@@ -54,6 +59,8 @@ All important constants and tunables are centralized in `src/config.js`.
 - `retryRules`: retry behavior per error type
 - `limits`: values shown in capabilities endpoint
 - `SAFE_FILENAME_RE`: shared filename policy
+- `session`: default and maximum session TTL values
+- `usage`: in-memory log retention limit
 
 This means you can adjust behavior from one file instead of hunting across modules.
 
@@ -175,20 +182,34 @@ Highlights:
 - command file operations enforce extension policy allowlists (unsafe extensions rejected)
 - workspace maintenance (`list_dir`, `clear_workspace`) runs against worker `/workspace`
 
+Session-aware workflows reuse the same worker so files persist across multiple `/run` calls until the session is deleted or expires.
+
 ---
 
 ## 11. API Endpoints
 
 - `GET /health`: liveness
 - `GET /capabilities`: supported languages, commands, limits, extension policy, retry rules
+- `POST /session/create`: reserve a worker and create a persistent workspace
+- `DELETE /session/:session_id`: free a reserved worker and clear its workspace
 - `GET /installed-modules`: returns Python and Node module inventory from live worker (API key required)
 - `POST /run`: execute code or run command (API key required)
-- `POST /convert/docx-to-pdf`: host utility endpoint using LibreOffice (API key required)
+- `GET /run/stream` and `POST /run/stream`: stream stdout/stderr as Server-Sent Events (API key required)
+- `GET /usage`: per-key usage summary (API key required)
+- `POST /convert/docx-to-pdf`: container-based LibreOffice conversion endpoint (API key required)
 
 ### Conversion availability contract
 
 - `GET /capabilities` exposes `host_utilities.docx_to_pdf_available` and `host_utilities.docx_to_pdf_binary`.
+- LibreOffice is installed in the sandbox image, so conversion happens inside the container.
 - If converter dependency is missing, `POST /convert/docx-to-pdf` returns `503` with explicit error.
+
+### Session and stream contract
+
+- `POST /session/create` returns a `session_id`, `expires_in`, `expires_at`, and reserved worker name.
+- Include `session_id` on later `/run` or `/run/stream` calls to preserve `/workspace` across steps.
+- `GET /run/stream` emits stdout and stderr lines as they arrive and ends with a `done` event.
+- `GET /usage` returns recent per-key request activity, duration totals, and run metadata.
 
 ---
 

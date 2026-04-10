@@ -5,6 +5,7 @@ RUN apt-get update && apt-get install -y \
     python3-pip \
     python3-venv \
     curl \
+    libreoffice \
     zip \
     unzip \
     && rm -rf /var/lib/apt/lists/*

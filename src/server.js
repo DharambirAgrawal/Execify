@@ -2,13 +2,13 @@ require('dotenv').config()
 const express = require('express')
 const { execFile } = require('child_process')
 const { promisify } = require('util')
-const fs = require('fs').promises
-const os = require('os')
 const path = require('path')
-const { initPool, getWorker, markBusy, markFree } = require('./pool')
-const { runCode, getExecutionPolicy } = require('./executor')
+const { initPool, getWorker, markBusy, markFree, cleanWorkerWorkspace } = require('./pool')
+const { runCode, runCodeStream, getExecutionPolicy } = require('./executor')
 const { runCommand, COMMANDS } = require('./commands')
 const { requireApiKey } = require('./auth')
+const { createSession, deleteSession, getSession, beginSessionUse, endSessionUse, getSessionSnapshot } = require('./sessionManager')
+const { recordUsage, getUsage } = require('./usageTracker')
 const config = require('./config')
 
 const execFileAsync = promisify(execFile)
@@ -19,15 +19,6 @@ async function dockerExec(args) {
   return execFileAsync('docker', args, {
     maxBuffer: config.execution.maxDockerBufferBytes
   })
-}
-
-async function dockerExecWithTimeout(args, timeoutMs) {
-  return Promise.race([
-    dockerExec(args),
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error('MODULE_PROBE_TIMEOUT')), timeoutMs)
-    )
-  ])
 }
 
 function safeParseJson(text, fallback = []) {
@@ -51,44 +42,281 @@ function sanitizeDocxFilename(rawName) {
   return fileName
 }
 
+async function writeBase64FileToWorker(worker, filename, base64Content) {
+  await dockerExec([
+    'exec',
+    worker.name,
+    'bash',
+    '-lc',
+    `printf '%s' '${base64Content}' | base64 -d > /workspace/${filename}`
+  ])
+}
+
+async function readBase64FileFromWorker(worker, filename) {
+  const { stdout } = await dockerExec([
+    'exec',
+    worker.name,
+    'bash',
+    '-lc',
+    `base64 -w 0 /workspace/${filename}`
+  ])
+
+  return String(stdout).trim()
+}
+
 async function detectDocxConverterBinary() {
+  const worker = getWorker()
+  if (!worker) {
+    return null
+  }
+
   for (const candidate of ['libreoffice', 'soffice']) {
     try {
-      await execFileAsync(candidate, ['--version'])
+      await dockerExec(['exec', worker.name, candidate, '--version'])
       return candidate
     } catch {}
   }
+
   return null
+}
+
+function normalizeRunPayload(req) {
+  const source = req.method === 'GET'
+    ? { ...req.query }
+    : { ...(req.body || {}) }
+
+  if (typeof source.payload === 'string') {
+    const parsed = safeParseJson(source.payload, null)
+    if (parsed && typeof parsed === 'object') {
+      return parsed
+    }
+  }
+
+  if (typeof source.files === 'string') {
+    source.files = safeParseJson(source.files, source.files)
+  }
+
+  if (typeof source.params === 'string') {
+    source.params = safeParseJson(source.params, source.params)
+  }
+
+  return source
+}
+
+function validateRunPayload(payload) {
+  if (!payload.type) {
+    return { status: 400, error: 'Missing field: type (execute or command)' }
+  }
+
+  if (payload.type === 'execute') {
+    if (!payload.language || !config.execution.languages.includes(payload.language)) {
+      return { status: 400, error: 'language must be python or node' }
+    }
+
+    if (!payload.code || typeof payload.code !== 'string') {
+      return { status: 400, error: 'Missing field: code' }
+    }
+
+    if (payload.code.length > config.execution.codeMaxChars) {
+      const maxKb = Math.round(config.execution.codeMaxChars / 1024)
+      return { status: 400, error: `Code too large (max ${maxKb}kb)` }
+    }
+  }
+
+  if (payload.type === 'command' && !payload.command) {
+    return { status: 400, error: 'Missing field: command' }
+  }
+
+  if (payload.type !== 'execute' && payload.type !== 'command') {
+    return { status: 400, error: 'type must be execute or command' }
+  }
+
+  return null
+}
+
+function sendSseEvent(res, payload) {
+  res.write(`data: ${JSON.stringify(payload)}\n\n`)
+}
+
+function sendSseError(res, error, status = 400) {
+  sendSseEvent(res, {
+    type: 'error',
+    status,
+    error: typeof error === 'string' ? error : String(error)
+  })
+  res.end()
+}
+
+async function resolveSessionWorker(sessionId) {
+  if (!sessionId) {
+    return { session: null, worker: null }
+  }
+
+  const session = getSession(sessionId)
+  if (!session) {
+    return { error: { status: 404, error: `Unknown session: ${sessionId}` } }
+  }
+
+  if (!beginSessionUse(session)) {
+    return { error: { status: 409, error: `Session is busy: ${sessionId}` } }
+  }
+
+  return { session, worker: session.worker }
+}
+
+async function handleRun(payload, apiKey, { stream = false, res = null } = {}) {
+  const startedAt = Date.now()
+  const validationError = validateRunPayload(payload)
+  if (validationError) {
+    recordUsage(apiKey, {
+      kind: payload.type === 'command' ? 'command' : (stream ? 'streamRun' : 'run'),
+      durationMs: Date.now() - startedAt,
+      language: payload.language || null,
+      command: payload.command || null,
+      sessionId: payload.session_id || payload.sessionId || null,
+      status: validationError.status,
+      streamed: stream
+    })
+
+    if (stream && res) {
+      sendSseError(res, validationError.error, validationError.status)
+      return null
+    }
+
+    return { status: validationError.status, body: { error: validationError.error } }
+  }
+
+  const sessionId = payload.session_id || payload.sessionId || null
+  const sessionResolution = await resolveSessionWorker(sessionId)
+  if (sessionResolution.error) {
+    recordUsage(apiKey, {
+      kind: payload.type === 'command' ? 'command' : (stream ? 'streamRun' : 'run'),
+      durationMs: Date.now() - startedAt,
+      language: payload.language || null,
+      command: payload.command || null,
+      sessionId,
+      status: sessionResolution.error.status,
+      streamed: stream
+    })
+
+    if (stream && res) {
+      sendSseError(res, sessionResolution.error.error, sessionResolution.error.status)
+      return null
+    }
+
+    return { status: sessionResolution.error.status, body: { error: sessionResolution.error.error } }
+  }
+
+  const { session, worker } = sessionResolution
+
+  try {
+    let result
+
+    if (payload.type === 'execute') {
+      const onStdoutLine = stream && res
+        ? (line) => sendSseEvent(res, { type: 'stdout', line })
+        : undefined
+      const onStderrLine = stream && res
+        ? (line) => sendSseEvent(res, { type: 'stderr', line })
+        : undefined
+
+      const runner = stream ? runCodeStream : runCode
+
+      result = await runner(
+        payload.language,
+        payload.code,
+        Array.isArray(payload.files) ? payload.files : [],
+        {
+          worker,
+          resetWorkspace: !session,
+          onStdoutLine,
+          onStderrLine
+        }
+      )
+    } else {
+      result = await runCommand(payload.command, payload.params || {}, worker)
+    }
+
+    const durationMs = Date.now() - startedAt
+    recordUsage(apiKey, {
+      kind: payload.type === 'execute' ? (stream ? 'streamRun' : 'run') : 'command',
+      durationMs,
+      language: payload.language || null,
+      command: payload.command || null,
+      sessionId,
+      exitCode: result.exitCode ?? null,
+      status: result.status ?? 200,
+      streamed: stream
+    })
+
+    if (payload.type === 'execute' && session) {
+      result.session_id = session.sessionId
+      result.session = getSessionSnapshot(session.sessionId)
+    }
+
+    if (stream && res) {
+      sendSseEvent(res, {
+        type: 'done',
+        exit_code: result.exitCode ?? 0,
+        error_type: result.errorType ?? null,
+        retryable: Boolean(result.retryable),
+        stdout: result.stdout || '',
+        stderr: result.stderr || '',
+        output_files: result.outputFiles || [],
+        session_id: session ? session.sessionId : null,
+        worker: session ? session.worker.name : null
+      })
+      res.end()
+      return null
+    }
+
+    return {
+      status: result.status && result.status !== 200 ? result.status : (result.errorType ? 422 : 200),
+      body: result
+    }
+  } finally {
+    if (session) {
+      endSessionUse(session)
+    }
+  }
 }
 
 const app = express()
 app.use(express.json({ limit: config.app.requestBodyLimit }))
 
-// Health check — no auth needed
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() })
 })
 
-// List available languages and commands — no auth needed
 app.get('/capabilities', (req, res) => {
   const policy = getExecutionPolicy()
 
   res.json({
-      languages: config.execution.languages,
+    languages: config.execution.languages,
     commands: Object.keys(COMMANDS),
-      endpoints: {
-        run: '/run',
-        module_inventory: '/installed-modules',
-        convert_docx_to_pdf: '/convert/docx-to-pdf'
-      },
-      host_utilities: {
-        docx_to_pdf_available: Boolean(docxConverterBinary),
-        docx_to_pdf_binary: docxConverterBinary
-      },
+    endpoints: {
+      run: '/run',
+      run_stream: '/run/stream',
+      session_create: '/session/create',
+      session_delete: '/session/:session_id',
+      usage: '/usage',
+      module_inventory: '/installed-modules',
+      convert_docx_to_pdf: '/convert/docx-to-pdf'
+    },
+    host_utilities: {
+      docx_to_pdf_available: Boolean(docxConverterBinary),
+      docx_to_pdf_binary: docxConverterBinary
+    },
+    features: {
+      session_workspaces: true,
+      streaming_output: true,
+      usage_tracking: true,
+      container_docx_conversion: true
+    },
     limits: {
-        timeout_seconds: config.execution.timeoutSeconds,
-        max_memory_mb: config.limits.maxMemoryMb,
-        max_file_size_mb: config.limits.maxFileSizeMb
+      timeout_seconds: config.execution.timeoutSeconds,
+      max_memory_mb: config.limits.maxMemoryMb,
+      max_file_size_mb: config.limits.maxFileSizeMb
     },
     policy: {
       allowed_input_extensions: policy.allowedInputExtensions,
@@ -96,14 +324,19 @@ app.get('/capabilities', (req, res) => {
       persist_outputs: policy.persistOutputs,
       persisted_output_dir: policy.persistOutputDir
     },
-      retry_rules: config.retryRules
+    retry_rules: config.retryRules
   })
 })
 
-// Return available Python and Node modules from a live sandbox worker.
+app.get('/usage', requireApiKey, (req, res) => {
+  res.json(getUsage(req.apiKey))
+})
+
 app.get('/installed-modules', requireApiKey, async (req, res) => {
+  const startedAt = Date.now()
   const worker = getWorker()
   if (!worker) {
+    recordUsage(req.apiKey, { kind: 'moduleInventory', durationMs: Date.now() - startedAt, status: 503 })
     return res.status(503).json({ error: 'No workers available for module probe' })
   }
 
@@ -125,22 +358,22 @@ app.get('/installed-modules', requireApiKey, async (req, res) => {
       'process.stdout.write(JSON.stringify(mods))'
     ].join('\n')
 
-    const pythonResult = await dockerExecWithTimeout(
-      ['exec', worker.name, 'python3', '-c', pythonScript],
-      timeoutMs
-    )
+    const pythonResult = await Promise.race([
+      dockerExec(['exec', worker.name, 'python3', '-c', pythonScript]),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('MODULE_PROBE_TIMEOUT')), timeoutMs))
+    ])
 
-    const nodeBuiltinResult = await dockerExecWithTimeout(
-      ['exec', worker.name, 'node', '-e', nodeBuiltinScript],
-      timeoutMs
-    )
+    const nodeBuiltinResult = await Promise.race([
+      dockerExec(['exec', worker.name, 'node', '-e', nodeBuiltinScript]),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('MODULE_PROBE_TIMEOUT')), timeoutMs))
+    ])
 
     let nodeGlobalPackages = []
     try {
-      const nodeGlobalResult = await dockerExecWithTimeout(
-        ['exec', worker.name, 'npm', 'ls', '-g', '--depth=0', '--json'],
-        timeoutMs
-      )
+      const nodeGlobalResult = await Promise.race([
+        dockerExec(['exec', worker.name, 'npm', 'ls', '-g', '--depth=0', '--json']),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('MODULE_PROBE_TIMEOUT')), timeoutMs))
+      ])
       const parsed = safeParseJson(nodeGlobalResult.stdout, {})
       nodeGlobalPackages = Object.keys(parsed.dependencies || {}).sort()
     } catch {
@@ -149,6 +382,8 @@ app.get('/installed-modules', requireApiKey, async (req, res) => {
 
     const pythonModules = safeParseJson(pythonResult.stdout, [])
     const nodeBuiltinModules = safeParseJson(nodeBuiltinResult.stdout, [])
+
+    recordUsage(req.apiKey, { kind: 'moduleInventory', durationMs: Date.now() - startedAt, status: 200 })
 
     return res.json({
       worker: worker.name,
@@ -167,6 +402,12 @@ app.get('/installed-modules', requireApiKey, async (req, res) => {
       }
     })
   } catch (err) {
+    recordUsage(req.apiKey, {
+      kind: 'moduleInventory',
+      durationMs: Date.now() - startedAt,
+      status: err.message === 'MODULE_PROBE_TIMEOUT' ? 504 : 500
+    })
+
     if (err.message === 'MODULE_PROBE_TIMEOUT') {
       return res.status(504).json({ error: 'Module probe timed out' })
     }
@@ -177,117 +418,169 @@ app.get('/installed-modules', requireApiKey, async (req, res) => {
   }
 })
 
-// Main execution endpoint — auth required
-app.post('/run', requireApiKey, async (req, res) => {
-  const { type, language, code, files, command, params } = req.body
+app.post('/session/create', requireApiKey, async (req, res) => {
+  const startedAt = Date.now()
+  const result = await createSession({ expiresIn: req.body?.expires_in ?? req.body?.expiresIn })
 
-  if (!type) {
-    return res.status(400).json({ error: 'Missing field: type (execute or command)' })
+  if (result.status === 503) {
+    recordUsage(req.apiKey, { kind: 'sessionCreate', durationMs: Date.now() - startedAt, status: 503 })
+    return res.status(503).json({ error: result.error })
   }
 
-  if (type === 'execute') {
-    if (!language || !config.execution.languages.includes(language)) {
-      return res.status(400).json({ error: 'language must be python or node' })
-    }
-    if (!code || typeof code !== 'string') {
-      return res.status(400).json({ error: 'Missing field: code' })
-    }
-    if (code.length > config.execution.codeMaxChars) {
-      const maxKb = Math.round(config.execution.codeMaxChars / 1024)
-      return res.status(400).json({ error: `Code too large (max ${maxKb}kb)` })
-    }
-
-    const result = await runCode(language, code, files || [])
-
-    if (result.status === 503) {
-      return res.status(503).json({ error: result.error })
-    }
-
-    if (
-      result.errorType === 'syntax_error' ||
-      result.errorType === 'missing_dependency' ||
-      result.errorType === 'input_validation'
-    ) {
-      return res.status(422).json(result)
-    }
-
-    return res.json(result)
-  }
-
-  if (type === 'command') {
-    if (!command) {
-      return res.status(400).json({ error: 'Missing field: command' })
-    }
-
-    const result = await runCommand(command, params || {})
-    return res.json(result)
-  }
-
-  return res.status(400).json({ error: 'type must be execute or command' })
+  recordUsage(req.apiKey, { kind: 'sessionCreate', durationMs: Date.now() - startedAt, status: 200 })
+  return res.status(201).json(result)
 })
 
-// Host utility endpoint (outside sandbox): convert DOCX to PDF via LibreOffice.
+app.delete('/session/:session_id', requireApiKey, async (req, res) => {
+  const startedAt = Date.now()
+  const result = await deleteSession(req.params.session_id)
+
+  if (!result) {
+    recordUsage(req.apiKey, { kind: 'sessionDelete', durationMs: Date.now() - startedAt, status: 404 })
+    return res.status(404).json({ error: 'Session not found' })
+  }
+
+  if (result.error) {
+    recordUsage(req.apiKey, { kind: 'sessionDelete', durationMs: Date.now() - startedAt, status: result.status || 409 })
+    return res.status(result.status || 409).json({ error: result.error })
+  }
+
+  recordUsage(req.apiKey, { kind: 'sessionDelete', durationMs: Date.now() - startedAt, status: 200 })
+  return res.json({ success: true, ...result })
+})
+
+app.post('/run', requireApiKey, async (req, res) => {
+  const startedAt = Date.now()
+  const payload = normalizeRunPayload(req)
+  const outcome = await handleRun(payload, req.apiKey, { stream: false })
+
+  if (!outcome) {
+    return
+  }
+
+  return res.status(outcome.status).json(outcome.body)
+})
+
+async function handleStreamRun(req, res) {
+  const startedAt = Date.now()
+  const payload = normalizeRunPayload(req)
+
+  res.status(200)
+  res.set({
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive'
+  })
+  res.flushHeaders?.()
+
+  const outcome = await handleRun(payload, req.apiKey, { stream: true, res })
+  if (outcome) {
+    recordUsage(req.apiKey, {
+      kind: 'streamRun',
+      durationMs: Date.now() - startedAt,
+      language: payload.language || null,
+      command: payload.command || null,
+      sessionId: payload.session_id || payload.sessionId || null,
+      status: outcome.status,
+      streamed: true
+    })
+
+    sendSseEvent(res, {
+      type: 'done',
+      exit_code: outcome.body?.exitCode ?? 0,
+      error_type: outcome.body?.errorType ?? null,
+      retryable: Boolean(outcome.body?.retryable),
+      stdout: outcome.body?.stdout || '',
+      stderr: outcome.body?.stderr || '',
+      output_files: outcome.body?.outputFiles || [],
+      session_id: outcome.body?.session_id || null,
+      worker: outcome.body?.worker || null
+    })
+    res.end()
+  }
+}
+
+app.get('/run/stream', requireApiKey, handleStreamRun)
+app.post('/run/stream', requireApiKey, handleStreamRun)
+
 app.post('/convert/docx-to-pdf', requireApiKey, async (req, res) => {
+  const startedAt = Date.now()
   const { file, filename } = req.body || {}
 
   if (!file || !filename) {
+    recordUsage(req.apiKey, { kind: 'conversion', durationMs: Date.now() - startedAt, status: 400 })
     return res.status(400).json({ error: 'Missing file or filename' })
   }
 
   if (!docxConverterBinary) {
-    return res.status(503).json({ error: 'DOCX to PDF conversion unavailable: libreoffice/soffice not installed on host' })
+    recordUsage(req.apiKey, { kind: 'conversion', durationMs: Date.now() - startedAt, status: 503 })
+    return res.status(503).json({ error: 'DOCX to PDF conversion unavailable: libreoffice/soffice not installed in the sandbox image' })
   }
 
-  let tempDir = ''
+  const worker = getWorker()
+  if (!worker) {
+    recordUsage(req.apiKey, { kind: 'conversion', durationMs: Date.now() - startedAt, status: 503 })
+    return res.status(503).json({ error: 'No workers available for conversion' })
+  }
+
+  markBusy(worker)
 
   try {
     const safeFilename = sanitizeDocxFilename(filename)
-    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'execify-convert-'))
+    const pdfName = safeFilename.replace(/\.docx$/i, '.pdf')
 
-    const inputPath = path.join(tempDir, safeFilename)
-    await fs.writeFile(inputPath, Buffer.from(file, 'base64'))
+    await cleanWorkerWorkspace(worker)
+    await writeBase64FileToWorker(worker, safeFilename, String(file))
 
-    await execFileAsync(docxConverterBinary, [
+    await dockerExec([
+      'exec',
+      worker.name,
+      docxConverterBinary,
       '--headless',
       '--convert-to',
       'pdf',
       '--outdir',
-      tempDir,
-      inputPath
+      '/workspace',
+      `/workspace/${safeFilename}`
     ])
 
-    const pdfName = safeFilename.replace(/\.docx$/i, '.pdf')
-    const pdfPath = path.join(tempDir, pdfName)
-    const pdfContent = await fs.readFile(pdfPath)
+    const pdfContent = await readBase64FileFromWorker(worker, pdfName)
+
+    recordUsage(req.apiKey, { kind: 'conversion', durationMs: Date.now() - startedAt, status: 200 })
 
     return res.json({
       filename: pdfName,
-      content: pdfContent.toString('base64'),
-      size: pdfContent.length
+      content: pdfContent,
+      size: Buffer.from(pdfContent, 'base64').length,
+      worker: worker.name
     })
   } catch (err) {
+    recordUsage(req.apiKey, { kind: 'conversion', durationMs: Date.now() - startedAt, status: 500 })
     return res.status(500).json({ error: err.message })
   } finally {
-    if (tempDir) {
-      try {
-        await fs.rm(tempDir, { recursive: true, force: true })
-      } catch {}
-    }
+    try {
+      await cleanWorkerWorkspace(worker)
+    } catch {}
+    markFree(worker)
   }
 })
 
 const PORT = config.app.port
 
 async function start() {
+  await initPool()
   docxConverterBinary = await detectDocxConverterBinary()
+
   if (!docxConverterBinary) {
-    console.warn('DOCX converter unavailable: install libreoffice (or soffice) to enable /convert/docx-to-pdf')
+    console.warn('DOCX converter unavailable in the sandbox image: install libreoffice to enable /convert/docx-to-pdf')
   }
 
-  await initPool()
   app.listen(PORT, () => {
     console.log(`Execify running on port ${PORT}`)
   })
 }
 
-start()
+start().catch((err) => {
+  console.error(err)
+  process.exit(1)
+})
